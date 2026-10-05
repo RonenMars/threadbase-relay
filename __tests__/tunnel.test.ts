@@ -216,13 +216,13 @@ describe("http surface", () => {
     expect(await res.json()).toMatchObject({ ok: true });
   });
 
-  it("answers an attached route and an unknown route identically", async () => {
+  it("answers an unsealed probe identically for an attached and an unknown route", async () => {
     const { routeId } = await attach(generateKeyPair());
     const known = await fetch(`http://${url}/r/${routeId}/api/info`);
     const unknown = await fetch(`http://${url}/r/${"A".repeat(32)}/api/info`);
 
     for (const res of [known, unknown]) {
-      expect(res.status).toBe(503);
+      expect(res.status).toBe(400);
       expect(res.headers.get("x-tb-relay-error")).toBe("1");
     }
     expect(await known.text()).toBe(await unknown.text());
