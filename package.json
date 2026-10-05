@@ -1,0 +1,23 @@
+{
+  "name": "threadbase-relay",
+  "version": "0.0.0",
+  "private": true,
+  "description": "Optional blind transport relay between Threadbase clients and a user-owned streamer",
+  "type": "module",
+  "engines": { "node": ">=22 <25" },
+  "scripts": {
+    "dev": "tsx src/main.ts",
+    "lint": "tsc --noEmit",
+    "test": "vitest run"
+  },
+  "dependencies": {
+    "ws": "^8.21.3"
+  },
+  "devDependencies": {
+    "@types/node": "^26.6.2",
+    "@types/ws": "^8.18.1",
+    "tsx": "^4.23.15",
+    "typescript": "^7.0.2",
+    "vitest": "^5.0.1"
+  }
+}
