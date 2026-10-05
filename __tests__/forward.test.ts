@@ -1,5 +1,14 @@
+import { request as httpRequest } from "http";
 import type { AddressInfo } from "net";
 import { WebSocket } from "ws";
+import {
+  createFlowReceiver,
+  createFlowSender,
+  encodeCredit,
+  FlowError,
+  parseCredit,
+  STREAM_WINDOW_BYTES,
+} from "../src/flow";
 import { decodeFrame, encodeFrame, type Frame, FRAME_TYPES } from "../src/frames";
 import { generateKeyPair } from "../src/noise/noise";
 import { createRelay, type Relay } from "../src/relay";
@@ -54,6 +63,9 @@ async function streamer(onFrame: (frame: Frame, ws: WebSocket) => void = () => {
 
 /** Echoes the request body back as the response once the request ends. */
 function echo(frame: Frame, ws: WebSocket): void {
+  if (frame.type === FRAME_TYPES.DATA) {
+    ws.send(encodeFrame(FRAME_TYPES.WINDOW, frame.streamId, encodeCredit(frame.payload.length)));
+  }
   if (frame.type !== FRAME_TYPES.END) return;
   const head = { status: 200, headers: { "x-tb-env": "sealed", "set-cookie": "leak=1" } };
   ws.send(encodeFrame(FRAME_TYPES.HEAD, frame.streamId, Buffer.from(JSON.stringify(head))));
@@ -83,6 +95,16 @@ describe("forwarding", () => {
     expect(open.clientTag).toMatch(/^[A-Za-z0-9_-]{16}$/);
   });
 
+  it("derives the client tag from the connection, not from a header the client chose", async () => {
+    const s = await streamer(echo);
+    for (const spoof of ["1.1.1.1", "2.2.2.2"]) {
+      await call(s.routeId, "/api/info", { headers: { ...SEALED, "x-forwarded-for": spoof, "x-real-ip": spoof } });
+    }
+    const tags = s.frames.filter((f) => f.type === FRAME_TYPES.OPEN).map((f) => JSON.parse(f.payload.toString()).clientTag);
+    expect(tags).toHaveLength(2);
+    expect(tags[0]).toBe(tags[1]);
+  });
+
   it("forwards a request body as opaque bytes", async () => {
     const s = await streamer(echo);
     const body = Buffer.alloc(200_000, 7);
@@ -91,6 +113,51 @@ describe("forwarding", () => {
     const data = s.frames.filter((f) => f.type === FRAME_TYPES.DATA);
     expect(data.length).toBeGreaterThan(1);
     expect(Buffer.concat(data.map((f) => f.payload)).equals(body)).toBe(true);
+  });
+
+  it("sends no more of an upload than the streamer has granted", async () => {
+    // A streamer that never grants credit: the relay must stop at the window.
+    const s = await streamer();
+    const sent = () => s.frames.filter((f) => f.type === FRAME_TYPES.DATA).reduce((n, f) => n + f.payload.length, 0);
+    const pending = call(s.routeId, "/api/x", { method: "POST", headers: SEALED, body: Buffer.alloc(1_000_000) });
+    for (let i = 0; i < 200 && sent() < STREAM_WINDOW_BYTES; i++) await new Promise((r) => setTimeout(r, 5));
+    await new Promise((r) => setTimeout(r, 100));
+    expect(sent()).toBe(STREAM_WINDOW_BYTES);
+    expect(s.frames.some((f) => f.type === FRAME_TYPES.END)).toBe(false);
+
+    // Granting the rest lets it finish.
+    const id = s.frames[0].streamId;
+    s.ws.on("message", (data) => echo(decodeFrame(data as Buffer), s.ws));
+    s.ws.send(encodeFrame(FRAME_TYPES.WINDOW, id, encodeCredit(STREAM_WINDOW_BYTES)));
+    expect((await pending).status).toBe(200);
+    expect(sent()).toBe(1_000_000);
+  });
+
+  it("grants credit for a response as the client takes it", async () => {
+    const big = await streamer((f, ws) => {
+      if (f.type !== FRAME_TYPES.END) return;
+      ws.send(encodeFrame(FRAME_TYPES.HEAD, f.streamId, Buffer.from(JSON.stringify({ status: 200, headers: {} }))));
+      for (let i = 0; i < 4; i++) ws.send(encodeFrame(FRAME_TYPES.DATA, f.streamId, Buffer.alloc(65536, 1)));
+    });
+    const windows = () => big.frames.filter((f) => f.type === FRAME_TYPES.WINDOW);
+    const ok = await call(big.routeId, "/api/info", { headers: SEALED });
+    const body = ok.arrayBuffer();
+    for (let i = 0; i < 200 && windows().length < 4; i++) await new Promise((r) => setTimeout(r, 5));
+    big.ws.send(encodeFrame(FRAME_TYPES.END, big.frames[0].streamId));
+    expect((await body).byteLength).toBe(4 * 65536);
+    const granted = windows();
+    expect(granted.map((f) => JSON.parse(f.payload.toString()).credit)).toEqual([65536, 65536, 65536, 65536]);
+  });
+
+  it("refuses a body that declares more than the largest upload", async () => {
+    const s = await streamer(echo);
+    const res = await new Promise<number>((resolve) => {
+      const req = httpRequest(`http://${base}/r/${s.routeId}/api/x`, { method: "POST", headers: { ...SEALED, "content-length": String(70 * 1024 * 1024) } }, (r) => resolve(r.statusCode ?? 0));
+      req.on("error", () => {});
+      req.flushHeaders();
+    });
+    expect(res).toBe(400);
+    expect(s.frames).toEqual([]);
   });
 
   it("carries the two handshakes without a context", async () => {
@@ -175,5 +242,29 @@ describe("forwarding", () => {
     for (const id of held) echo({ type: FRAME_TYPES.END, streamId: id, payload: Buffer.alloc(0) }, s.ws);
     expect((await Promise.all(pending)).every((r) => r.status === 200)).toBe(true);
     expect(relay.registry.get(s.routeId)?.open(() => {})).not.toBeNull();
+  });
+});
+
+describe("flow control", () => {
+  it("counts a peer that sends past its window as a violation", () => {
+    const granted: number[] = [];
+    const receiver = createFlowReceiver((n) => granted.push(n));
+    expect(receiver.accept(STREAM_WINDOW_BYTES)).toBe(true);
+    expect(receiver.accept(1)).toBe(false);
+
+    const drained = createFlowReceiver((n) => granted.push(n));
+    expect(drained.accept(STREAM_WINDOW_BYTES)).toBe(true);
+    drained.drained(65536);
+    expect(drained.accept(65536)).toBe(true);
+    expect(granted).toEqual([65536]);
+  });
+
+  it("refuses credit beyond the window and a malformed grant", () => {
+    const sender = createFlowSender(() => {}, { pause() {}, resume() {} });
+    expect(() => sender.grant(1)).toThrow(FlowError);
+    for (const bad of ["{", "{}", '{"credit":0}', '{"credit":-5}', '{"credit":1.5}', '{"credit":"9"}']) {
+      expect(() => parseCredit(Buffer.from(bad))).toThrow(FlowError);
+    }
+    expect(parseCredit(encodeCredit(7))).toBe(7);
   });
 });

@@ -1,6 +1,7 @@
 import { createHash, randomBytes } from "crypto";
 import type http from "http";
-import { FRAME_TYPES, MAX_FRAME_PAYLOAD_BYTES } from "./frames";
+import { createFlowReceiver, createFlowSender, encodeCredit, FlowError, parseCredit } from "./flow";
+import { FRAME_TYPES } from "./frames";
 import type { Tunnel } from "./registry";
 import type { RelayLog } from "./relay";
 
@@ -24,17 +25,22 @@ const forwarded = (name: string) => name.startsWith("x-tb-") || FORWARDED_HEADER
 /** The two handshakes: the only requests that are not sealed under a context. */
 const HANDSHAKE_PATHS = new Set(["/api/e2ee/open", "/api/pair/exchange"]);
 
-// ponytail: fixed cap and no flow control until the generic-HTTP phase; an
-// upload needs credit-based windows before this can rise.
-const MAX_REQUEST_BODY_BYTES = 1024 * 1024;
+// The streamer's largest sealed upload record, plus room for its framing. The
+// streamer enforces the real limit; this only stops a body with no end.
+const MAX_REQUEST_BODY_BYTES = 64 * 1024 * 1024 + 64 * 1024;
 const STREAM_IDLE_TIMEOUT_MS = 60_000;
 
 // The streamer rate-limits on this instead of an address it cannot see. Salted
 // per process, so it is not an IP and does not survive a restart.
+//
+// A forwarding header is whatever the client typed unless a proxy we run behind
+// replaced it, so it is read only on the one host known to do that: Vercel
+// overwrites `x-real-ip` with the address it accepted the connection from.
+// Anywhere else a client could mint a fresh bucket per request by changing it.
 const TAG_SALT = randomBytes(16);
 function clientTag(req: http.IncomingMessage): string {
-  const fwd = req.headers["x-forwarded-for"];
-  const ip = (Array.isArray(fwd) ? fwd[0] : fwd)?.split(",")[0].trim() || req.socket.remoteAddress || "";
+  const proxied = process.env.VERCEL ? req.headers["x-real-ip"] : undefined;
+  const ip = (typeof proxied === "string" && proxied) || req.socket.remoteAddress || "";
   return createHash("sha256").update(TAG_SALT).update(ip).digest("base64url").slice(0, 16);
 }
 
@@ -59,6 +65,11 @@ export function forwardHttp(
   target: string,
   log: RelayLog,
 ): void {
+  if (Number(req.headers["content-length"] ?? 0) > MAX_REQUEST_BODY_BYTES) {
+    refuse(res, 400, "RELAY_UNSUPPORTED_REQUEST", "Request body too large");
+    return;
+  }
+
   let done = false;
   let idle: NodeJS.Timeout;
   const finish = () => {
@@ -99,7 +110,24 @@ export function forwardHttp(
         fail(502, "RELAY_STREAM_RESET", "Streamer sent a malformed response");
       }
     } else if (frame.type === FRAME_TYPES.DATA) {
-      if (res.headersSent) res.write(frame.payload);
+      const bytes = frame.payload.length;
+      if (!res.headersSent || !inbound.accept(bytes)) {
+        stream?.send(FRAME_TYPES.RESET);
+        return fail(502, "RELAY_STREAM_RESET", "Streamer broke the stream protocol");
+      }
+      // Credit goes back only once the client has taken the bytes, so a slow
+      // phone stalls the streamer instead of filling this process.
+      res.write(frame.payload, (err) => {
+        if (!err && !done) inbound.drained(bytes);
+      });
+    } else if (frame.type === FRAME_TYPES.WINDOW) {
+      try {
+        outbound.grant(parseCredit(frame.payload));
+      } catch (err) {
+        if (!(err instanceof FlowError)) throw err;
+        stream?.send(FRAME_TYPES.RESET);
+        fail(502, "RELAY_STREAM_RESET", "Streamer broke the stream protocol");
+      }
     } else if (frame.type === FRAME_TYPES.END) {
       if (!res.headersSent) return fail(502, "RELAY_STREAM_RESET", "Streamer closed the stream");
       finish();
@@ -113,6 +141,11 @@ export function forwardHttp(
     return;
   }
   touch();
+  const inbound = createFlowReceiver((credit) => stream.send(FRAME_TYPES.WINDOW, encodeCredit(credit)));
+  const outbound = createFlowSender((payload) => {
+    if (done || stream.send(FRAME_TYPES.DATA, payload)) return;
+    fail(503, "RELAY_OVERLOADED", "Streamer is not keeping up");
+  }, req);
 
   const headers: Record<string, string> = {};
   for (const [name, value] of Object.entries(req.headers)) {
@@ -132,13 +165,14 @@ export function forwardHttp(
       fail(400, "RELAY_UNSUPPORTED_REQUEST", "Request body too large");
       return;
     }
-    for (let at = 0; at < chunk.length; at += MAX_FRAME_PAYLOAD_BYTES) {
-      stream.send(FRAME_TYPES.DATA, chunk.subarray(at, at + MAX_FRAME_PAYLOAD_BYTES));
-    }
+    touch();
+    outbound.write(chunk);
   });
-  req.on("end", () => {
-    if (!done) stream.send(FRAME_TYPES.END);
-  });
+  req.on("end", () =>
+    outbound.end(() => {
+      if (!done) stream.send(FRAME_TYPES.END);
+    }),
+  );
   // The client went away before the response finished: tell the streamer to stop.
   res.on("close", () => {
     if (done) return;
