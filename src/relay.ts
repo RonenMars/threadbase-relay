@@ -1,7 +1,16 @@
 import { randomUUID } from "crypto";
 import http from "http";
 import { type RawData, WebSocket, WebSocketServer } from "ws";
-import { decodeFrame, FrameError, MAX_FRAME_BYTES, MAX_FRAME_PAYLOAD_BYTES } from "./frames";
+import { forwardHttp, isCarried, refuse } from "./forward";
+import {
+  decodeFrame,
+  encodeFrame,
+  type Frame,
+  FRAME_TYPES,
+  FrameError,
+  MAX_FRAME_BYTES,
+  MAX_FRAME_PAYLOAD_BYTES,
+} from "./frames";
 import type { KeyPair } from "./noise/noise";
 import { RouteRegistry, type Tunnel } from "./registry";
 import { type AcceptedTunnel, acceptTunnel, UnsupportedProtocolError } from "./tunnel-auth";
@@ -35,16 +44,6 @@ export interface Relay {
   registry: RouteRegistry;
 }
 
-/** Relay-originated refusals are marked so a client never mistakes one for the streamer's. */
-function refuse(res: http.ServerResponse, status: number, code: string, error: string): void {
-  res.writeHead(status, {
-    "content-type": "application/json",
-    "cache-control": "no-store",
-    "x-tb-relay-error": "1",
-  });
-  res.end(JSON.stringify({ error, code }));
-}
-
 // A pseudonymous handle for logs: enough to correlate, not enough to dial.
 const routeTag = (routeId: string) => routeId.slice(0, 8);
 
@@ -60,10 +59,23 @@ export function createRelay(options: RelayOptions): Relay {
       res.end(JSON.stringify({ ok: true, version: options.version ?? "dev" }));
       return;
     }
-    // Client routing lands in a later phase. Until then every route answers the
-    // way an offline one will, which is also how an unknown one must answer.
     if (path.startsWith(ROUTE_PREFIX)) {
-      refuse(res, 503, "RELAY_STREAMER_OFFLINE", "Streamer is not connected to the relay");
+      const slash = path.indexOf("/", ROUTE_PREFIX.length);
+      const routeId = path.slice(ROUTE_PREFIX.length, slash === -1 ? undefined : slash);
+      const target = slash === -1 ? "/" : (req.url ?? "").slice(slash);
+      // Decided before the lookup, so a probe that is not sealed learns nothing
+      // about whether the route is attached.
+      if (!isCarried(req, target)) {
+        refuse(res, 400, "RELAY_UNSUPPORTED_REQUEST", "Only end-to-end-encrypted requests are relayed");
+        return;
+      }
+      const tunnel = registry.get(routeId);
+      // An unknown route answers exactly as an offline one: never 404.
+      if (!tunnel) {
+        refuse(res, 503, "RELAY_STREAMER_OFFLINE", "Streamer is not connected to the relay");
+        return;
+      }
+      forwardHttp(req, res, tunnel, target, log);
       return;
     }
     refuse(res, 400, "RELAY_UNSUPPORTED_REQUEST", "Unsupported request");
@@ -83,6 +95,8 @@ export function createRelay(options: RelayOptions): Relay {
     const tunnelId = randomUUID();
     let accepted: AcceptedTunnel | null = null;
     let tunnel: Tunnel | null = null;
+    const streams = new Map<number, (frame: Frame) => void>();
+    let nextStreamId = 1;
 
     const deadline = setTimeout(() => ws.close(CLOSE_HANDSHAKE_TIMEOUT, "handshake timeout"), handshakeTimeoutMs);
 
@@ -92,8 +106,9 @@ export function createRelay(options: RelayOptions): Relay {
       if (tunnel) {
         try {
           if (!isBinary) throw new FrameError("Text frame on tunnel");
-          // No streams exist yet, so a valid frame has nowhere to go and is dropped.
-          decodeFrame(bytes);
+          const frame = decodeFrame(bytes);
+          // A frame for a stream that already ended is late, not hostile: dropped.
+          streams.get(frame.streamId)?.(frame);
         } catch {
           log("tunnel.malformed_frame", { tunnelId });
           ws.close(CLOSE_MALFORMED, "malformed frame");
@@ -128,7 +143,22 @@ export function createRelay(options: RelayOptions): Relay {
         return;
       }
       clearTimeout(deadline);
-      tunnel = { id: tunnelId, routeId: accepted.routeId, close: (code, reason) => ws.close(code, reason) };
+      tunnel = {
+        id: tunnelId,
+        routeId: accepted.routeId,
+        close: (code, reason) => ws.close(code, reason),
+        open: (onFrame) => {
+          if (ws.readyState !== WebSocket.OPEN || streams.size >= TUNNEL_LIMITS.streams) return null;
+          const streamId = nextStreamId++;
+          streams.set(streamId, onFrame);
+          return {
+            send: (type, payload) => {
+              if (ws.readyState === WebSocket.OPEN) ws.send(encodeFrame(type, streamId, payload));
+            },
+            release: () => streams.delete(streamId),
+          };
+        },
+      };
       registry.attach(tunnel);
       log("tunnel.attached", { tunnelId, route: routeTag(tunnel.routeId) });
     });
@@ -137,6 +167,10 @@ export function createRelay(options: RelayOptions): Relay {
       clearTimeout(deadline);
       if (!tunnel) return;
       registry.detach(tunnel);
+      for (const [streamId, onFrame] of streams) {
+        onFrame({ type: FRAME_TYPES.RESET, streamId, payload: Buffer.alloc(0) });
+      }
+      streams.clear();
       log("tunnel.closed", { tunnelId, route: routeTag(tunnel.routeId), code });
     });
     ws.on("error", () => ws.terminate());
