@@ -8,7 +8,8 @@ import type { Frame, FrameType } from "./frames";
 
 /** One logical stream. Its id is allocated by the relay and means nothing outside its tunnel. */
 export interface Stream {
-  send(type: FrameType, payload?: Buffer): void;
+  /** False when the tunnel is gone or already holds too many unsent bytes. */
+  send(type: FrameType, payload?: Buffer): boolean;
   /** Forget the stream. Frames that still arrive for it are dropped. */
   release(): void;
 }

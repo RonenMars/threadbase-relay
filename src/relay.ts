@@ -1,6 +1,7 @@
 import { randomUUID } from "crypto";
 import http from "http";
 import { type RawData, WebSocket, WebSocketServer } from "ws";
+import { STREAM_WINDOW_BYTES } from "./flow";
 import { forwardHttp, isCarried, refuse } from "./forward";
 import {
   decodeFrame,
@@ -26,8 +27,11 @@ export const CLOSE_HANDSHAKE_TIMEOUT = 4408;
 export const TUNNEL_LIMITS = {
   framePayloadBytes: MAX_FRAME_PAYLOAD_BYTES,
   streams: 64,
-  streamWindowBytes: 256 * 1024,
+  streamWindowBytes: STREAM_WINDOW_BYTES,
 };
+
+/** Unsent bytes a tunnel may hold before new frames for it are refused. */
+const MAX_TUNNEL_BUFFERED_BYTES = 8 * 1024 * 1024;
 
 /** Fields are identifiers and counters only. Never a path, header or payload. */
 export type RelayLog = (event: string, fields?: Record<string, string | number>) => void;
@@ -153,7 +157,9 @@ export function createRelay(options: RelayOptions): Relay {
           streams.set(streamId, onFrame);
           return {
             send: (type, payload) => {
-              if (ws.readyState === WebSocket.OPEN) ws.send(encodeFrame(type, streamId, payload));
+              if (ws.readyState !== WebSocket.OPEN || ws.bufferedAmount > MAX_TUNNEL_BUFFERED_BYTES) return false;
+              ws.send(encodeFrame(type, streamId, payload));
+              return true;
             },
             release: () => streams.delete(streamId),
           };
