@@ -1,0 +1,37 @@
+# One always-on machine, on purpose. A streamer's tunnel and the client requests
+# for it must meet in the same process, so this app must not scale out or sleep:
+# a second machine would answer RELAY_STREAMER_OFFLINE for every tunnel it does
+# not hold.
+#
+#   fly launch --no-deploy --copy-config          (once, creates the app)
+#   fly secrets set RELAY_STATIC_KEY=<base64url>  (the X25519 private key)
+#   fly deploy --ha=false
+#   fly certs add <hostname>
+
+app = "threadbase-relay"
+primary_region = "ams"
+
+[http_service]
+  internal_port = 8080
+  force_https = true
+  auto_stop_machines = "off"
+  auto_start_machines = false
+  min_machines_running = 1
+
+  # Tunnels and relayed WebSockets are long-lived, so count connections; the
+  # default limit of 25 would turn clients away almost immediately.
+  [http_service.concurrency]
+    type = "connections"
+    soft_limit = 1500
+    hard_limit = 2000
+
+  [[http_service.checks]]
+    method = "GET"
+    path = "/healthz"
+    interval = "15s"
+    timeout = "5s"
+    grace_period = "10s"
+
+[[vm]]
+  size = "shared-cpu-1x"
+  memory = "512mb"

@@ -34,12 +34,18 @@ const STREAM_IDLE_TIMEOUT_MS = 60_000;
 // per process, so it is not an IP and does not survive a restart.
 //
 // A forwarding header is whatever the client typed unless a proxy we run behind
-// replaced it, so it is read only on the one host known to do that: Vercel
-// overwrites `x-real-ip` with the address it accepted the connection from.
-// Anywhere else a client could mint a fresh bucket per request by changing it.
+// replaced it, so one is read only on a host known to do that: Fly's proxy sets
+// `fly-client-ip` and Vercel sets `x-real-ip` to the address the connection came
+// from. Anywhere else a client could mint a fresh bucket per request by
+// changing it. On those hosts the socket address is the proxy's, which would
+// put every client in one bucket instead.
 const TAG_SALT = randomBytes(16);
 function clientTag(req: http.IncomingMessage): string {
-  const proxied = process.env.VERCEL ? req.headers["x-real-ip"] : undefined;
+  const proxied = process.env.FLY_APP_NAME
+    ? req.headers["fly-client-ip"]
+    : process.env.VERCEL
+      ? req.headers["x-real-ip"]
+      : undefined;
   const ip = (typeof proxied === "string" && proxied) || req.socket.remoteAddress || "";
   return createHash("sha256").update(TAG_SALT).update(ip).digest("base64url").slice(0, 16);
 }

@@ -98,7 +98,7 @@ describe("forwarding", () => {
   it("derives the client tag from the connection, not from a header the client chose", async () => {
     const s = await streamer(echo);
     for (const spoof of ["1.1.1.1", "2.2.2.2"]) {
-      await call(s.routeId, "/api/info", { headers: { ...SEALED, "x-forwarded-for": spoof, "x-real-ip": spoof } });
+      await call(s.routeId, "/api/info", { headers: { ...SEALED, "x-forwarded-for": spoof, "x-real-ip": spoof, "fly-client-ip": spoof } });
     }
     const tags = s.frames.filter((f) => f.type === FRAME_TYPES.OPEN).map((f) => JSON.parse(f.payload.toString()).clientTag);
     expect(tags).toHaveLength(2);
