@@ -15,6 +15,7 @@ import {
 import type { KeyPair } from "./noise/noise";
 import { RouteRegistry, type Tunnel } from "./registry";
 import { type AcceptedTunnel, acceptTunnel, UnsupportedProtocolError } from "./tunnel-auth";
+import { forwardSocket, isCarriedSocket, refuseUpgrade } from "./ws-forward";
 
 export const TUNNEL_PATH = "/tunnel";
 export const ROUTE_PREFIX = "/r/";
@@ -48,6 +49,17 @@ export interface Relay {
   registry: RouteRegistry;
 }
 
+/** Split `/r/<routeId>/<target>` into the route and what the streamer is asked for. */
+function parseRoute(url: string): { routeId: string; target: string } | null {
+  const path = url.split("?", 1)[0];
+  if (!path.startsWith(ROUTE_PREFIX)) return null;
+  const slash = path.indexOf("/", ROUTE_PREFIX.length);
+  return {
+    routeId: path.slice(ROUTE_PREFIX.length, slash === -1 ? undefined : slash),
+    target: slash === -1 ? "/" : url.slice(slash),
+  };
+}
+
 // A pseudonymous handle for logs: enough to correlate, not enough to dial.
 const routeTag = (routeId: string) => routeId.slice(0, 8);
 
@@ -63,10 +75,9 @@ export function createRelay(options: RelayOptions): Relay {
       res.end(JSON.stringify({ ok: true, version: options.version ?? "dev" }));
       return;
     }
-    if (path.startsWith(ROUTE_PREFIX)) {
-      const slash = path.indexOf("/", ROUTE_PREFIX.length);
-      const routeId = path.slice(ROUTE_PREFIX.length, slash === -1 ? undefined : slash);
-      const target = slash === -1 ? "/" : (req.url ?? "").slice(slash);
+    const route = parseRoute(req.url ?? "/");
+    if (route) {
+      const { routeId, target } = route;
       // Decided before the lookup, so a probe that is not sealed learns nothing
       // about whether the route is attached.
       if (!isCarried(req, target)) {
@@ -88,11 +99,20 @@ export function createRelay(options: RelayOptions): Relay {
   const wss = new WebSocketServer({ noServer: true, maxPayload: MAX_FRAME_BYTES });
 
   server.on("upgrade", (req, socket, head) => {
-    if ((req.url ?? "").split("?", 1)[0] !== TUNNEL_PATH) {
-      socket.destroy();
+    // A peer that resets mid-upgrade must not take the process down.
+    socket.on("error", () => {});
+    const url = req.url ?? "/";
+    if (url.split("?", 1)[0] === TUNNEL_PATH) {
+      wss.handleUpgrade(req, socket, head, (ws) => serveTunnel(ws));
       return;
     }
-    wss.handleUpgrade(req, socket, head, (ws) => serveTunnel(ws));
+    const route = parseRoute(url);
+    // Decided before the lookup, as for HTTP: an unsealed probe learns nothing.
+    if (!route || !isCarriedSocket(req, route.target)) {
+      refuseUpgrade(socket, 400);
+      return;
+    }
+    forwardSocket(req, socket, head, registry.get(route.routeId), route.target, log);
   });
 
   function serveTunnel(ws: WebSocket): void {

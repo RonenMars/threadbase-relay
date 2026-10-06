@@ -268,3 +268,154 @@ describe("flow control", () => {
     expect(parseCredit(encodeCredit(7))).toBe(7);
   });
 });
+
+// A client WebSocket rides the tunnel as one stream. The first test is the
+// positive control for the refusals below it.
+describe("sockets", () => {
+  const TICKET = { "x-tb-ticket": "ticket-1" };
+  const json = (value: object) => Buffer.from(JSON.stringify(value));
+  const dial = (routeId: string, path = "/ws", headers: Record<string, string> = TICKET, protocols: string[] = []) => {
+    const ws = new WebSocket(`ws://${base}/r/${routeId}${path}`, protocols, { headers });
+    sockets.push(ws);
+    return ws;
+  };
+  const closed = (ws: WebSocket) =>
+    new Promise<{ code: number; reason: string }>((resolve) => ws.once("close", (code, reason) => resolve({ code, reason: reason.toString() })));
+  /** The status of an upgrade that was refused instead of completed. */
+  const refusedWith = (ws: WebSocket) =>
+    new Promise<number | undefined>((resolve) => {
+      ws.once("unexpected-response", (_req, res) => resolve(res.statusCode));
+      ws.once("open", () => resolve(undefined));
+      ws.once("error", () => {});
+    });
+
+  /** Accepts every socket and sends each message piece straight back. */
+  function accept(frame: Frame, ws: WebSocket): void {
+    if (frame.type === FRAME_TYPES.OPEN) {
+      const offered = String(JSON.parse(frame.payload.toString()).headers["sec-websocket-protocol"] ?? "");
+      const protocol = offered.includes("threadbase-e2ee-v1") ? "threadbase-e2ee-v1" : undefined;
+      ws.send(encodeFrame(FRAME_TYPES.HEAD, frame.streamId, json({ accepted: true, protocol })));
+    } else if (frame.type === FRAME_TYPES.DATA) {
+      ws.send(encodeFrame(FRAME_TYPES.WINDOW, frame.streamId, encodeCredit(frame.payload.length - 1)));
+      ws.send(encodeFrame(FRAME_TYPES.DATA, frame.streamId, frame.payload));
+    }
+  }
+
+  it("carries a ticketed socket both ways, whole messages intact", async () => {
+    const s = await streamer(accept);
+    const ws = dial(s.routeId, "/ws", { ...TICKET, cookie: "a=b" });
+    await new Promise((resolve) => ws.once("open", resolve));
+
+    // Larger than one frame and than the 256 KiB window, so it is split and
+    // has to wait for credit in both directions.
+    const message = Buffer.alloc(600_000);
+    for (let i = 0; i < message.length; i++) message[i] = i % 251;
+    const received: Buffer[] = [];
+    ws.on("message", (data, isBinary) => {
+      expect(isBinary).toBe(true);
+      received.push(data as Buffer);
+    });
+    ws.send(message);
+    ws.send(Buffer.from("second"));
+    for (let i = 0; i < 400 && received.length < 2; i++) await new Promise((r) => setTimeout(r, 5));
+
+    expect(received).toHaveLength(2);
+    expect(received[0].equals(message)).toBe(true);
+    expect(received[1].toString()).toBe("second");
+
+    const open = JSON.parse(s.frames[0].payload.toString());
+    expect(open).toMatchObject({ kind: "ws", method: "GET", target: "/ws", headers: TICKET });
+    expect(open.headers.cookie).toBeUndefined();
+    expect(open.clientTag).toMatch(/^[A-Za-z0-9_-]{16}$/);
+    // Credit for what the streamer sent comes back as the client takes it.
+    expect(s.frames.some((f) => f.type === FRAME_TYPES.WINDOW)).toBe(true);
+  });
+
+  it("passes close codes through in both directions", async () => {
+    const s = await streamer(accept);
+    const first = dial(s.routeId);
+    await new Promise((resolve) => first.once("open", resolve));
+    first.close(4001, "client done");
+    for (let i = 0; i < 200 && !s.frames.some((f) => f.type === FRAME_TYPES.END); i++) await new Promise((r) => setTimeout(r, 5));
+    const end = s.frames.find((f) => f.type === FRAME_TYPES.END);
+    expect(JSON.parse(end?.payload.toString() ?? "{}")).toEqual({ code: 4001, reason: "client done" });
+
+    const second = dial(s.routeId);
+    await new Promise((resolve) => second.once("open", resolve));
+    const streamId = s.frames.filter((f) => f.type === FRAME_TYPES.OPEN)[1].streamId;
+    s.ws.send(encodeFrame(FRAME_TYPES.END, streamId, json({ code: 4401, reason: "revoked" })));
+    expect(await closed(second)).toEqual({ code: 4401, reason: "revoked" });
+  });
+
+  it("selects only the subprotocol the streamer chose, never the offered ticket", async () => {
+    const s = await streamer(accept);
+    const ws = dial(s.routeId, "/ws", {}, ["tb-ticket.secret", "threadbase-e2ee-v1"]);
+    await new Promise((resolve) => ws.once("open", resolve));
+    expect(ws.protocol).toBe("threadbase-e2ee-v1");
+    expect(JSON.parse(s.frames[0].payload.toString()).headers["sec-websocket-protocol"]).toContain("tb-ticket.secret");
+  });
+
+  it("refuses a socket with no ticket, or with a credential, and never writes it to the tunnel", async () => {
+    const s = await streamer(accept);
+    expect(await refusedWith(dial(s.routeId, "/ws", {}))).toBe(400);
+    expect(await refusedWith(dial(s.routeId, "/ws?key=tb_abc"))).toBe(400);
+    expect(await refusedWith(dial(s.routeId, "/ws", { ...TICKET, authorization: "Bearer tb_abc" }))).toBe(400);
+    expect(await refusedWith(dial(s.routeId, "/api/info"))).toBe(400);
+    // Identical for a route nobody is attached to: the probe learns nothing.
+    expect(await refusedWith(dial("nobody", "/ws", {}))).toBe(400);
+    expect(s.frames).toHaveLength(0);
+  });
+
+  it("closes a socket for an unknown or offline route with the relay's code", async () => {
+    expect(await closed(dial("nobody"))).toEqual({ code: 1013, reason: "RELAY_STREAMER_OFFLINE" });
+  });
+
+  it("answers a refused upgrade with the streamer's status", async () => {
+    const s = await streamer((frame, ws) => {
+      if (frame.type === FRAME_TYPES.OPEN) ws.send(encodeFrame(FRAME_TYPES.HEAD, frame.streamId, json({ accepted: false, status: 401 })));
+    });
+    expect(await refusedWith(dial(s.routeId))).toBe(401);
+  });
+
+  it("closes the client when its tunnel dies or the streamer resets the stream", async () => {
+    const s = await streamer(accept);
+    const first = dial(s.routeId);
+    await new Promise((resolve) => first.once("open", resolve));
+    s.ws.send(encodeFrame(FRAME_TYPES.RESET, s.frames[0].streamId));
+    expect(await closed(first)).toEqual({ code: 1013, reason: "RELAY_STREAM_RESET" });
+
+    const second = dial(s.routeId);
+    await new Promise((resolve) => second.once("open", resolve));
+    s.ws.terminate();
+    expect(await closed(second)).toEqual({ code: 1013, reason: "RELAY_STREAM_RESET" });
+  });
+
+  it("refuses a text message and tells the streamer to stop", async () => {
+    const s = await streamer(accept);
+    const ws = dial(s.routeId);
+    await new Promise((resolve) => ws.once("open", resolve));
+    ws.send("plaintext");
+    expect((await closed(ws)).code).toBe(1003);
+    expect(s.frames.some((f) => f.type === FRAME_TYPES.RESET)).toBe(true);
+    expect(s.frames.some((f) => f.type === FRAME_TYPES.DATA)).toBe(false);
+  });
+
+  it("holds a route to its socket limit and frees a slot when one closes", async () => {
+    const s = await streamer(accept);
+    const open: WebSocket[] = [];
+    for (let i = 0; i < 16; i++) {
+      const ws = dial(s.routeId);
+      await new Promise((resolve) => ws.once("open", resolve));
+      open.push(ws);
+    }
+    expect(await closed(dial(s.routeId))).toEqual({ code: 1013, reason: "RELAY_OVERLOADED" });
+    // HTTP is unaffected: sockets are held under the tunnel's stream limit.
+    expect((await call(s.routeId, "/api/pair/exchange", { method: "POST" })).status).not.toBe(503);
+
+    open[0].close();
+    for (let i = 0; i < 200 && !s.frames.some((f) => f.type === FRAME_TYPES.END); i++) await new Promise((r) => setTimeout(r, 5));
+    const again = dial(s.routeId);
+    await new Promise((resolve) => again.once("open", resolve));
+    expect(again.readyState).toBe(WebSocket.OPEN);
+  });
+});

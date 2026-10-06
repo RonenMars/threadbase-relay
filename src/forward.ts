@@ -20,7 +20,7 @@ export function refuse(res: http.ServerResponse, status: number, code: string, e
 }
 
 const FORWARDED_HEADERS = new Set(["content-type", "content-length", "accept", "if-none-match", "etag", "cache-control"]);
-const forwarded = (name: string) => name.startsWith("x-tb-") || FORWARDED_HEADERS.has(name);
+export const forwarded = (name: string) => name.startsWith("x-tb-") || FORWARDED_HEADERS.has(name);
 
 /** The two handshakes: the only requests that are not sealed under a context. */
 const HANDSHAKE_PATHS = new Set(["/api/e2ee/open", "/api/pair/exchange"]);
@@ -40,7 +40,7 @@ const STREAM_IDLE_TIMEOUT_MS = 60_000;
 // changing it. On those hosts the socket address is the proxy's, which would
 // put every client in one bucket instead.
 const TAG_SALT = randomBytes(16);
-function clientTag(req: http.IncomingMessage): string {
+export function clientTag(req: http.IncomingMessage): string {
   const proxied = process.env.FLY_APP_NAME
     ? req.headers["fly-client-ip"]
     : process.env.VERCEL
@@ -56,12 +56,17 @@ function clientTag(req: http.IncomingMessage): string {
  * sent in the clear from ever being written to the tunnel.
  */
 export function isCarried(req: http.IncomingMessage, target: string): boolean {
-  const q = target.indexOf("?");
-  const pathname = q === -1 ? target : target.slice(0, q);
-  if (req.headers.authorization !== undefined) return false;
-  if (q !== -1 && new URLSearchParams(target.slice(q + 1)).has("key")) return false;
+  if (carriesCredential(req, target)) return false;
   if (req.headers["x-tb-ctx"] !== undefined) return true;
-  return req.method === "POST" && HANDSHAKE_PATHS.has(pathname);
+  return req.method === "POST" && HANDSHAKE_PATHS.has(target.split("?", 1)[0]);
+}
+
+/** A long-term credential in the clear: an `Authorization` header or a `?key=`. */
+export function carriesCredential(req: http.IncomingMessage, target: string): boolean {
+  const q = target.indexOf("?");
+  return (
+    req.headers.authorization !== undefined || (q !== -1 && new URLSearchParams(target.slice(q + 1)).has("key"))
+  );
 }
 
 export function forwardHttp(

@@ -34,10 +34,15 @@ export interface FlowSender {
 /**
  * Sends `source`'s bytes as DATA no faster than credit allows, pausing the
  * source while bytes wait. At most one source chunk is ever held here.
+ *
+ * `last` is true on the piece that completes a written chunk, which is how a
+ * WebSocket stream keeps its message boundaries; `maxPiece` leaves room for
+ * the flag byte that carries it.
  */
 export function createFlowSender(
-  emit: (payload: Buffer) => void,
+  emit: (payload: Buffer, last: boolean) => void,
   source: { pause(): unknown; resume(): unknown },
+  maxPiece: number = MAX_FRAME_PAYLOAD_BYTES,
 ): FlowSender {
   let credit = STREAM_WINDOW_BYTES;
   const queue: Buffer[] = [];
@@ -46,11 +51,11 @@ export function createFlowSender(
   const flush = () => {
     while (queue.length > 0 && credit > 0) {
       const head = queue[0];
-      const size = Math.min(head.length, credit, MAX_FRAME_PAYLOAD_BYTES);
+      const size = Math.min(head.length, credit, maxPiece);
       credit -= size;
       if (size === head.length) queue.shift();
       else queue[0] = head.subarray(size);
-      emit(head.subarray(0, size));
+      emit(head.subarray(0, size), size === head.length);
     }
     if (queue.length > 0) return void source.pause();
     source.resume();
