@@ -2,7 +2,7 @@ import { randomUUID } from "crypto";
 import http from "http";
 import { type RawData, WebSocket, WebSocketServer } from "ws";
 import { STREAM_WINDOW_BYTES } from "./flow";
-import { forwardHttp, isCarried, refuse } from "./forward";
+import { clientTag, forwardHttp, isCarried, refuse } from "./forward";
 import {
   decodeFrame,
   encodeFrame,
@@ -13,6 +13,7 @@ import {
   MAX_FRAME_PAYLOAD_BYTES,
 } from "./frames";
 import type { KeyPair } from "./noise/noise";
+import { createRateLimiter } from "./rate-limit";
 import { RouteRegistry, type Tunnel } from "./registry";
 import { type AcceptedTunnel, acceptTunnel, UnsupportedProtocolError } from "./tunnel-auth";
 import { forwardSocket, isCarriedSocket, refuseUpgrade } from "./ws-forward";
@@ -24,6 +25,17 @@ export const CLOSE_MALFORMED = 4400;
 export const CLOSE_AUTH_FAILED = 4401;
 export const CLOSE_UNSUPPORTED_PROTOCOL = 4406;
 export const CLOSE_HANDSHAKE_TIMEOUT = 4408;
+export const CLOSE_RATE_LIMITED = 4429;
+
+/** Per minute. Clients and tunnel dials are keyed by the client tag, replacements by route. */
+export const RATE_LIMITS = {
+  /** Relayed requests and sockets from one client address, across all routes. */
+  clientRequests: 600,
+  /** Tunnel dials from one address: each costs the relay a Diffie-Hellman. */
+  tunnelHandshakes: 30,
+  /** Times a route's tunnel may be replaced, so two holders of one key cannot flap it. */
+  tunnelReplacements: 10,
+};
 
 export const TUNNEL_LIMITS = {
   framePayloadBytes: MAX_FRAME_PAYLOAD_BYTES,
@@ -42,6 +54,7 @@ export interface RelayOptions {
   version?: string;
   handshakeTimeoutMs?: number;
   log?: RelayLog;
+  rateLimits?: Partial<typeof RATE_LIMITS>;
 }
 
 export interface Relay {
@@ -67,6 +80,10 @@ export function createRelay(options: RelayOptions): Relay {
   const log = options.log ?? (() => {});
   const handshakeTimeoutMs = options.handshakeTimeoutMs ?? 10_000;
   const registry = new RouteRegistry();
+  const limits = { ...RATE_LIMITS, ...options.rateLimits };
+  const clients = createRateLimiter(limits.clientRequests, 60_000);
+  const dials = createRateLimiter(limits.tunnelHandshakes, 60_000);
+  const replacements = createRateLimiter(limits.tunnelReplacements, 60_000);
 
   const server = http.createServer((req, res) => {
     const path = (req.url ?? "/").split("?", 1)[0];
@@ -78,6 +95,14 @@ export function createRelay(options: RelayOptions): Relay {
     const route = parseRoute(req.url ?? "/");
     if (route) {
       const { routeId, target } = route;
+      // Counted before anything else, so probing for routes is limited too.
+      const wait = clients.take(clientTag(req));
+      if (wait) {
+        log("client.rate_limited");
+        res.setHeader("retry-after", String(wait));
+        refuse(res, 429, "RELAY_RATE_LIMITED", "Too many requests");
+        return;
+      }
       // Decided before the lookup, so a probe that is not sealed learns nothing
       // about whether the route is attached.
       if (!isCarried(req, target)) {
@@ -103,10 +128,22 @@ export function createRelay(options: RelayOptions): Relay {
     socket.on("error", () => {});
     const url = req.url ?? "/";
     if (url.split("?", 1)[0] === TUNNEL_PATH) {
+      const wait = dials.take(clientTag(req));
+      if (wait) {
+        log("tunnel.rate_limited");
+        refuseUpgrade(socket, 429, wait);
+        return;
+      }
       wss.handleUpgrade(req, socket, head, (ws) => serveTunnel(ws));
       return;
     }
     const route = parseRoute(url);
+    const wait = route ? clients.take(clientTag(req)) : 0;
+    if (wait) {
+      log("client.rate_limited");
+      refuseUpgrade(socket, 429, wait);
+      return;
+    }
     // Decided before the lookup, as for HTTP: an unsealed probe learns nothing.
     if (!route || !isCarriedSocket(req, route.target)) {
       refuseUpgrade(socket, 400);
@@ -167,6 +204,12 @@ export function createRelay(options: RelayOptions): Relay {
         return;
       }
       clearTimeout(deadline);
+      // The serving tunnel stays; the newcomer waits out the window.
+      if (registry.get(accepted.routeId) && replacements.take(accepted.routeId)) {
+        log("tunnel.replacement_rate_limited", { tunnelId, route: routeTag(accepted.routeId) });
+        ws.close(CLOSE_RATE_LIMITED, "replaced too often");
+        return;
+      }
       tunnel = {
         id: tunnelId,
         routeId: accepted.routeId,
