@@ -75,6 +75,8 @@ export function forwardSocket(
   tunnel: Tunnel | undefined,
   target: string,
   log: RelayLog,
+  /** Charges bytes to the route's quota; false once it is spent. */
+  meter: (bytes: number) => boolean = () => true,
 ): void {
   const protocols = offeredProtocols(req);
   let ws: WebSocket | null = null;
@@ -133,7 +135,9 @@ export function forwardSocket(
         client.close(1003, "binary only");
         return;
       }
-      outbound.write(Array.isArray(data) ? Buffer.concat(data) : Buffer.from(data as ArrayBuffer));
+      const bytes = Array.isArray(data) ? Buffer.concat(data) : Buffer.from(data as ArrayBuffer);
+      if (!meter(bytes.length)) return abort("RELAY_RATE_LIMITED");
+      outbound.write(bytes);
     });
     client.on("close", (code, reason) => {
       clearInterval(ping);
@@ -175,6 +179,7 @@ export function forwardSocket(
       wss.handleUpgrade(req, socket, upgradeHead, attach);
     } else if (frame.type === FRAME_TYPES.DATA) {
       const piece = frame.payload.subarray(1);
+      if (!meter(piece.length)) return abort("RELAY_RATE_LIMITED");
       if (!ws || frame.payload.length === 0 || !inbound.accept(piece.length)) return abort("RELAY_STREAM_RESET");
       // Credit goes back only once the client has taken the bytes, so a slow
       // phone stalls the streamer's socket instead of filling this process.

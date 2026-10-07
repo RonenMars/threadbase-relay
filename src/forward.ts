@@ -75,6 +75,8 @@ export function forwardHttp(
   tunnel: Tunnel,
   target: string,
   log: RelayLog,
+  /** Charges bytes to the route's quota; false once it is spent. */
+  meter: (bytes: number) => boolean = () => true,
 ): void {
   if (Number(req.headers["content-length"] ?? 0) > MAX_REQUEST_BODY_BYTES) {
     refuse(res, 400, "RELAY_UNSUPPORTED_REQUEST", "Request body too large");
@@ -122,6 +124,10 @@ export function forwardHttp(
       }
     } else if (frame.type === FRAME_TYPES.DATA) {
       const bytes = frame.payload.length;
+      if (!meter(bytes)) {
+        stream?.send(FRAME_TYPES.RESET);
+        return fail(429, "RELAY_RATE_LIMITED", "This streamer has used its relay quota for today");
+      }
       if (!res.headersSent || !inbound.accept(bytes)) {
         stream?.send(FRAME_TYPES.RESET);
         return fail(502, "RELAY_STREAM_RESET", "Streamer broke the stream protocol");
@@ -177,6 +183,11 @@ export function forwardHttp(
       return;
     }
     touch();
+    if (!meter(chunk.length)) {
+      stream.send(FRAME_TYPES.RESET);
+      fail(429, "RELAY_RATE_LIMITED", "This streamer has used its relay quota for today");
+      return;
+    }
     outbound.write(chunk);
   });
   req.on("end", () =>
