@@ -39,6 +39,15 @@ const wss = new WebSocketServer({
 });
 const socketCounts = new WeakMap<Tunnel, number>();
 
+/**
+ * Close every relayed client socket, so phones reconnect instead of waiting on
+ * a process that is going away.
+ * ponytail: process-wide, which is right while one process runs one relay.
+ */
+export function closeClientSockets(code: number, reason: string): void {
+  for (const client of wss.clients) client.close(code, reason);
+}
+
 const offeredProtocols = (req: http.IncomingMessage) =>
   String(req.headers["sec-websocket-protocol"] ?? "")
     .split(",")

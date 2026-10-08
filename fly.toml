@@ -11,6 +11,11 @@
 app = "threadbase-relay"
 primary_region = "ams"
 
+# The relay drains on this signal: it lets requests in flight finish for up to
+# 8 s, then closes tunnels and sockets with 1012 so peers reconnect.
+kill_signal = "SIGTERM"
+kill_timeout = 10
+
 [http_service]
   internal_port = 8080
   force_https = true
