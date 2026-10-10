@@ -46,9 +46,10 @@ const offeredProtocols = (req: http.IncomingMessage) =>
     .filter(Boolean);
 
 /** Refuse an upgrade without completing it. */
-export function refuseUpgrade(socket: Duplex, status: number): void {
+export function refuseUpgrade(socket: Duplex, status: number, retryAfterSeconds?: number): void {
+  const retry = retryAfterSeconds ? `retry-after: ${retryAfterSeconds}\r\n` : "";
   socket.end(
-    `HTTP/1.1 ${status} ${http.STATUS_CODES[status] ?? "Refused"}\r\nconnection: close\r\ncontent-length: 0\r\n\r\n`,
+    `HTTP/1.1 ${status} ${http.STATUS_CODES[status] ?? "Refused"}\r\nconnection: close\r\n${retry}content-length: 0\r\n\r\n`,
   );
 }
 
