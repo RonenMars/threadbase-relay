@@ -1,3 +1,4 @@
+import http from "http";
 import { generateKeyPair, keyPairFromRawPrivate } from "./noise/noise";
 import { createRelay } from "./relay";
 
@@ -16,7 +17,7 @@ const relayKeyPair = loadRelayKeyPair();
 const log = (event: string, fields: Record<string, string | number> = {}) =>
   console.log(JSON.stringify({ t: new Date().toISOString(), event, ...fields }));
 
-const { server, drain } = createRelay({ relayKeyPair, version: process.env.npm_package_version, log });
+const { server, drain, metrics } = createRelay({ relayKeyPair, version: process.env.npm_package_version, log });
 
 // Inside fly.toml's kill_timeout, which is when the platform stops asking.
 const DRAIN_DEADLINE_MS = 8_000;
@@ -27,6 +28,16 @@ if (!process.env.VERCEL) {
   server.listen(port, () =>
     log("relay.listening", { port, relayPublicKey: relayKeyPair.publicKeyRaw.toString("base64url") }),
   );
+  // Its own port, which fly.toml's [metrics] scrapes and the public service never maps.
+  if (process.env.METRICS_PORT) {
+    http
+      .createServer((req, res) => {
+        const found = req.url === "/metrics";
+        res.writeHead(found ? 200 : 404, { "content-type": "text/plain; version=0.0.4" });
+        res.end(found ? metrics() : "");
+      })
+      .listen(Number(process.env.METRICS_PORT));
+  }
   for (const signal of ["SIGTERM", "SIGINT"] as const) {
     process.once(signal, () => void drain(DRAIN_DEADLINE_MS).finally(() => process.exit(0)));
   }

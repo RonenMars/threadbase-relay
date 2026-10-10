@@ -37,6 +37,17 @@ kill_timeout = 10
     timeout = "5s"
     grace_period = "10s"
 
+# Set here, not in the image, so the metrics port opens only where a deployment
+# asks for it.
+[env]
+  METRICS_PORT = "9091"
+
+# Prometheus text from a port the public service does not map; Fly scrapes it
+# into the org's managed metrics.
+[metrics]
+  port = 9091
+  path = "/metrics"
+
 [[vm]]
   size = "shared-cpu-1x"
   memory = "512mb"
