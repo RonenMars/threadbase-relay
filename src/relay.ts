@@ -16,7 +16,7 @@ import type { KeyPair } from "./noise/noise";
 import { createConcurrencyLimit, createRateLimiter } from "./rate-limit";
 import { RouteRegistry, type Tunnel } from "./registry";
 import { type AcceptedTunnel, acceptTunnel, UnsupportedProtocolError } from "./tunnel-auth";
-import { forwardSocket, isCarriedSocket, refuseUpgrade } from "./ws-forward";
+import { closeClientSockets, forwardSocket, isCarriedSocket, refuseUpgrade } from "./ws-forward";
 
 export const TUNNEL_PATH = "/tunnel";
 export const ROUTE_PREFIX = "/r/";
@@ -26,6 +26,8 @@ export const CLOSE_AUTH_FAILED = 4401;
 export const CLOSE_UNSUPPORTED_PROTOCOL = 4406;
 export const CLOSE_HANDSHAKE_TIMEOUT = 4408;
 export const CLOSE_RATE_LIMITED = 4429;
+/** WebSocket "service restart": the peer should come back, not give up. */
+export const CLOSE_RESTARTING = 1012;
 
 /** Per minute. Clients and tunnel dials are keyed by the client tag, replacements by route. */
 export const RATE_LIMITS = {
@@ -74,6 +76,11 @@ export interface RelayOptions {
 export interface Relay {
   server: http.Server;
   registry: RouteRegistry;
+  /**
+   * Stop taking work, let requests in flight finish for up to `deadlineMs`,
+   * then close every tunnel and socket with CLOSE_RESTARTING.
+   */
+  drain(deadlineMs: number): Promise<void>;
 }
 
 /** Split `/r/<routeId>/<target>` into the route and what the streamer is asked for. */
@@ -102,8 +109,20 @@ export function createRelay(options: RelayOptions): Relay {
   const tunnelConnections = createConcurrencyLimit(limits.tunnelConnections);
   const routeBytes = createRateLimiter(limits.routeBytesPerDay, 86_400_000);
   const meter = (routeId: string) => (bytes: number) => routeBytes.take(routeId, bytes) === 0;
+  let draining = false;
+  let inFlight = 0;
 
   const server = http.createServer((req, res) => {
+    // Answering instead of closing the listener: Fly's proxy reaches us over
+    // connections it keeps open, so only an answer turns its requests away, and
+    // a failing /healthz is what tells it this machine is going.
+    if (draining) {
+      res.setHeader("connection", "close");
+      refuse(res, 503, "RELAY_RESTARTING", "Relay is restarting");
+      return;
+    }
+    inFlight++;
+    res.on("close", () => inFlight--);
     const path = (req.url ?? "/").split("?", 1)[0];
     if (req.method === "GET" && path === "/healthz") {
       res.writeHead(200, { "content-type": "application/json", "cache-control": "no-store" });
@@ -158,6 +177,10 @@ export function createRelay(options: RelayOptions): Relay {
   server.on("upgrade", (req, socket, head) => {
     // A peer that resets mid-upgrade must not take the process down.
     socket.on("error", () => {});
+    if (draining) {
+      refuseUpgrade(socket, 503);
+      return;
+    }
     const url = req.url ?? "/";
     if (url.split("?", 1)[0] === TUNNEL_PATH) {
       const tag = clientTag(req);
@@ -297,5 +320,23 @@ export function createRelay(options: RelayOptions): Relay {
     ws.on("error", () => ws.terminate());
   }
 
-  return { server, registry };
+  const settle = async (done: () => boolean, deadline: number) => {
+    while (!done() && Date.now() < deadline) await new Promise((r) => setTimeout(r, 25));
+  };
+
+  async function drain(deadlineMs: number): Promise<void> {
+    draining = true;
+    log("relay.draining", { inFlight, tunnels: registry.size });
+    closeClientSockets(CLOSE_RESTARTING, "relay restarting");
+    // Requests ride on tunnels, so the tunnels stay up until they finish.
+    await settle(() => inFlight === 0, Date.now() + deadlineMs);
+    for (const ws of wss.clients) ws.close(CLOSE_RESTARTING, "relay restarting");
+    // Long enough for the close frames to leave, not for a peer that never answers.
+    await settle(() => wss.clients.size === 0, Date.now() + 1000);
+    log("relay.drained", { inFlight });
+    server.closeAllConnections();
+    await new Promise((resolve) => server.close(resolve));
+  }
+
+  return { server, registry, drain };
 }

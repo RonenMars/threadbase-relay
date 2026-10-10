@@ -16,7 +16,10 @@ const relayKeyPair = loadRelayKeyPair();
 const log = (event: string, fields: Record<string, string | number> = {}) =>
   console.log(JSON.stringify({ t: new Date().toISOString(), event, ...fields }));
 
-const { server } = createRelay({ relayKeyPair, version: process.env.npm_package_version, log });
+const { server, drain } = createRelay({ relayKeyPair, version: process.env.npm_package_version, log });
+
+// Inside fly.toml's kill_timeout, which is when the platform stops asking.
+const DRAIN_DEADLINE_MS = 8_000;
 
 // A serverless host takes the exported server and does the listening itself.
 if (!process.env.VERCEL) {
@@ -24,6 +27,9 @@ if (!process.env.VERCEL) {
   server.listen(port, () =>
     log("relay.listening", { port, relayPublicKey: relayKeyPair.publicKeyRaw.toString("base64url") }),
   );
+  for (const signal of ["SIGTERM", "SIGINT"] as const) {
+    process.once(signal, () => void drain(DRAIN_DEADLINE_MS).finally(() => process.exit(0)));
+  }
 }
 
 export default server;
