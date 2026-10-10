@@ -5,7 +5,7 @@ import { createFlowReceiver, createFlowSender, encodeCredit, FlowError, parseCre
 import { FRAME_TYPES, MAX_FRAME_PAYLOAD_BYTES } from "./frames";
 import { carriesCredential, clientTag, forwarded } from "./forward";
 import type { Tunnel } from "./registry";
-import type { RelayLog } from "./relay";
+import { count as countMetric } from "./metrics";
 
 // Carries one client WebSocket down a streamer's tunnel as a logical stream.
 // The upgrade is completed only once the streamer has accepted it, so the
@@ -48,6 +48,8 @@ export function closeClientSockets(code: number, reason: string): void {
   for (const client of wss.clients) client.close(code, reason);
 }
 
+export const openClientSockets = () => wss.clients.size;
+
 const offeredProtocols = (req: http.IncomingMessage) =>
   String(req.headers["sec-websocket-protocol"] ?? "")
     .split(",")
@@ -56,6 +58,7 @@ const offeredProtocols = (req: http.IncomingMessage) =>
 
 /** Refuse an upgrade without completing it. */
 export function refuseUpgrade(socket: Duplex, status: number, retryAfterSeconds?: number): void {
+  countMetric("relay_upgrade_refused_total", ["status", String(status)]);
   const retry = retryAfterSeconds ? `retry-after: ${retryAfterSeconds}\r\n` : "";
   socket.end(
     `HTTP/1.1 ${status} ${http.STATUS_CODES[status] ?? "Refused"}\r\nconnection: close\r\n${retry}content-length: 0\r\n\r\n`,
@@ -83,7 +86,6 @@ export function forwardSocket(
   upgradeHead: Buffer,
   tunnel: Tunnel | undefined,
   target: string,
-  log: RelayLog,
   /** Charges bytes to the route's quota; false once it is spent. */
   meter: (bytes: number) => boolean = () => true,
 ): void {
@@ -246,5 +248,5 @@ export function forwardSocket(
     FRAME_TYPES.OPEN,
     Buffer.from(JSON.stringify({ kind: "ws", method: "GET", target, headers, clientTag: clientTag(req) })),
   );
-  log("stream.opened", { tunnelId: tunnel.id, kind: "ws" });
+  countMetric("relay_streams_opened_total", ["kind", "ws"]);
 }

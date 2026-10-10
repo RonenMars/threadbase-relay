@@ -2,8 +2,8 @@ import { createHash, randomBytes } from "crypto";
 import type http from "http";
 import { createFlowReceiver, createFlowSender, encodeCredit, FlowError, parseCredit } from "./flow";
 import { FRAME_TYPES } from "./frames";
+import { count } from "./metrics";
 import type { Tunnel } from "./registry";
-import type { RelayLog } from "./relay";
 
 // Forwards one client HTTP request down a streamer's tunnel and its response
 // back. The relay reads the request line and an allowlist of headers; bodies in
@@ -11,6 +11,7 @@ import type { RelayLog } from "./relay";
 
 /** Relay-originated refusals are marked so a client never mistakes one for the streamer's. */
 export function refuse(res: http.ServerResponse, status: number, code: string, error: string): void {
+  count("relay_refused_total", ["code", code]);
   res.writeHead(status, {
     "content-type": "application/json",
     "cache-control": "no-store",
@@ -74,7 +75,6 @@ export function forwardHttp(
   res: http.ServerResponse,
   tunnel: Tunnel,
   target: string,
-  log: RelayLog,
   /** Charges bytes to the route's quota; false once it is spent. */
   meter: (bytes: number) => boolean = () => true,
 ): void {
@@ -202,5 +202,6 @@ export function forwardHttp(
     finish();
   });
 
-  log("stream.opened", { tunnelId: tunnel.id });
+  // Counted, not logged: a line per request would record when each user is active.
+  count("relay_streams_opened_total", ["kind", "http"]);
 }

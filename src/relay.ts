@@ -16,7 +16,8 @@ import type { KeyPair } from "./noise/noise";
 import { createConcurrencyLimit, createRateLimiter } from "./rate-limit";
 import { RouteRegistry, type Tunnel } from "./registry";
 import { type AcceptedTunnel, acceptTunnel, UnsupportedProtocolError } from "./tunnel-auth";
-import { closeClientSockets, forwardSocket, isCarriedSocket, refuseUpgrade } from "./ws-forward";
+import { count, renderMetrics } from "./metrics";
+import { closeClientSockets, forwardSocket, isCarriedSocket, openClientSockets, refuseUpgrade } from "./ws-forward";
 
 export const TUNNEL_PATH = "/tunnel";
 export const ROUTE_PREFIX = "/r/";
@@ -81,6 +82,8 @@ export interface Relay {
    * then close every tunnel and socket with CLOSE_RESTARTING.
    */
   drain(deadlineMs: number): Promise<void>;
+  /** Counters and gauges as Prometheus text. */
+  metrics(): string;
 }
 
 /** Split `/r/<routeId>/<target>` into the route and what the streamer is asked for. */
@@ -98,7 +101,12 @@ function parseRoute(url: string): { routeId: string; target: string } | null {
 const routeTag = (routeId: string) => routeId.slice(0, 8);
 
 export function createRelay(options: RelayOptions): Relay {
-  const log = options.log ?? (() => {});
+  const emit = options.log ?? (() => {});
+  // Every logged event is also counted, so a metric exists for each one.
+  const log: RelayLog = (event, fields) => {
+    count("relay_events_total", ["event", event]);
+    emit(event, fields);
+  };
   const handshakeTimeoutMs = options.handshakeTimeoutMs ?? 10_000;
   const registry = new RouteRegistry();
   const limits = { ...RATE_LIMITS, ...options.rateLimits };
@@ -108,7 +116,10 @@ export function createRelay(options: RelayOptions): Relay {
   const clientConnections = createConcurrencyLimit(limits.clientConnections);
   const tunnelConnections = createConcurrencyLimit(limits.tunnelConnections);
   const routeBytes = createRateLimiter(limits.routeBytesPerDay, 86_400_000);
-  const meter = (routeId: string) => (bytes: number) => routeBytes.take(routeId, bytes) === 0;
+  const meter = (routeId: string) => (bytes: number) => {
+    count("relay_bytes_total", undefined, bytes);
+    return routeBytes.take(routeId, bytes) === 0;
+  };
   let draining = false;
   let inFlight = 0;
 
@@ -166,7 +177,7 @@ export function createRelay(options: RelayOptions): Relay {
         refuse(res, 429, "RELAY_RATE_LIMITED", "This streamer has used its relay quota for today");
         return;
       }
-      forwardHttp(req, res, tunnel, target, log, meter(routeId));
+      forwardHttp(req, res, tunnel, target, meter(routeId));
       return;
     }
     refuse(res, 400, "RELAY_UNSUPPORTED_REQUEST", "Unsupported request");
@@ -224,7 +235,7 @@ export function createRelay(options: RelayOptions): Relay {
       refuseUpgrade(socket, 429, quotaWait);
       return;
     }
-    forwardSocket(req, socket, head, registry.get(route.routeId), route.target, log, meter(route.routeId));
+    forwardSocket(req, socket, head, registry.get(route.routeId), route.target, meter(route.routeId));
   });
 
   function serveTunnel(ws: WebSocket): void {
@@ -338,5 +349,12 @@ export function createRelay(options: RelayOptions): Relay {
     await new Promise((resolve) => server.close(resolve));
   }
 
-  return { server, registry, drain };
+  const metrics = () =>
+    renderMetrics({
+      relay_tunnels: registry.size,
+      relay_requests_in_flight: inFlight,
+      relay_client_sockets: openClientSockets(),
+    });
+
+  return { server, registry, drain, metrics };
 }
