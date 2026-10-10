@@ -1,3 +1,4 @@
+import { createHash } from "crypto";
 import { request as httpRequest } from "http";
 import type { AddressInfo } from "net";
 import { WebSocket } from "ws";
@@ -9,7 +10,7 @@ import {
   parseCredit,
   STREAM_WINDOW_BYTES,
 } from "../src/flow";
-import { decodeFrame, encodeFrame, type Frame, FRAME_TYPES } from "../src/frames";
+import { decodeFrame, encodeFrame, type Frame, FRAME_TYPES, MAX_FRAME_PAYLOAD_BYTES } from "../src/frames";
 import { generateKeyPair } from "../src/noise/noise";
 import { createRelay, type Relay } from "../src/relay";
 import { completeTunnel, initiateTunnel, routeIdFromStreamerKey } from "../src/tunnel-auth";
@@ -148,6 +149,56 @@ describe("forwarding", () => {
     const granted = windows();
     expect(granted.map((f) => JSON.parse(f.payload.toString()).credit)).toEqual([65536, 65536, 65536, 65536]);
   });
+
+  it("carries the largest upload whole, in frames no bigger than the limit", async () => {
+    const s = await streamer(echo);
+    const body = Buffer.alloc(64 * 1024 * 1024);
+    for (let i = 0; i < body.length; i += 4096) body.writeUInt32BE(i, i);
+    const res = await call(s.routeId, "/api/sessions/s1/files", { method: "POST", headers: SEALED, body });
+
+    expect(res.status).toBe(200);
+    const data = s.frames.filter((f) => f.type === FRAME_TYPES.DATA);
+    expect(Math.max(...data.map((f) => f.payload.length))).toBeLessThanOrEqual(MAX_FRAME_PAYLOAD_BYTES);
+    expect(createHash("sha256").update(Buffer.concat(data.map((f) => f.payload))).digest("hex")).toBe(
+      createHash("sha256").update(body).digest("hex"),
+    );
+  }, 30_000);
+
+  it("tells the streamer to stop when the client abandons an upload", async () => {
+    const s = await streamer(echo);
+    const req = httpRequest(`http://${base}/r/${s.routeId}/api/x`, { method: "POST", headers: SEALED });
+    req.on("error", () => {});
+    req.write(Buffer.alloc(200_000, 1));
+    for (let i = 0; i < 200 && !s.frames.some((f) => f.type === FRAME_TYPES.DATA); i++) await new Promise((r) => setTimeout(r, 5));
+    req.destroy();
+    for (let i = 0; i < 200 && !s.frames.some((f) => f.type === FRAME_TYPES.RESET); i++) await new Promise((r) => setTimeout(r, 5));
+
+    expect(s.frames.some((f) => f.type === FRAME_TYPES.RESET)).toBe(true);
+    expect(s.frames.some((f) => f.type === FRAME_TYPES.END)).toBe(false);
+  });
+
+  it("refuses a body that declares no length and runs past the largest upload", async () => {
+    const s = await streamer(echo);
+    const status = await new Promise<number>((resolve) => {
+      const req = httpRequest(
+        `http://${base}/r/${s.routeId}/api/x`,
+        { method: "POST", headers: { ...SEALED, "transfer-encoding": "chunked" } },
+        (r) => resolve(r.statusCode ?? 0),
+      );
+      req.on("error", () => {});
+      const chunk = Buffer.alloc(1024 * 1024);
+      let sent = 0;
+      const pump = () => {
+        while (sent < 70 && req.write(chunk)) sent++;
+        if (sent < 70) req.once("drain", () => { sent++; pump(); });
+      };
+      pump();
+    });
+
+    expect(status).toBe(400);
+    expect(s.frames.some((f) => f.type === FRAME_TYPES.RESET)).toBe(true);
+    expect(s.frames.some((f) => f.type === FRAME_TYPES.END)).toBe(false);
+  }, 30_000);
 
   it("refuses a body that declares more than the largest upload", async () => {
     const s = await streamer(echo);
@@ -412,8 +463,12 @@ describe("sockets", () => {
     // HTTP is unaffected: sockets are held under the tunnel's stream limit.
     expect((await call(s.routeId, "/api/pair/exchange", { method: "POST" })).status).not.toBe(503);
 
+    // The first socket's own END: the HTTP request above sends one too, and
+    // waiting for any END raced the close.
+    const first = s.frames.find((f) => f.type === FRAME_TYPES.OPEN)!.streamId;
+    const ended = () => s.frames.some((f) => f.type === FRAME_TYPES.END && f.streamId === first);
     open[0].close();
-    for (let i = 0; i < 200 && !s.frames.some((f) => f.type === FRAME_TYPES.END); i++) await new Promise((r) => setTimeout(r, 5));
+    for (let i = 0; i < 200 && !ended(); i++) await new Promise((r) => setTimeout(r, 5));
     const again = dial(s.routeId);
     await new Promise((resolve) => again.once("open", resolve));
     expect(again.readyState).toBe(WebSocket.OPEN);
