@@ -1,0 +1,43 @@
+name: Notify streamer on release tag
+
+# When a version tag (v*) is pushed, tell threadbase-streamer which public key
+# this relay now serves, so it can pin it and open a PR against next. Same shape
+# as scanner's notify-streamer.yml; docs/releasing.md has the full flow.
+#
+# Requires:
+#   - secret STREAMER_DISPATCH_PAT: a PAT with Contents read/write on
+#     RonenMars/threadbase-streamer. The default GITHUB_TOKEN cannot dispatch
+#     across repositories.
+#   - variable RELAY_PUBLIC_KEY: the X25519 public key matching the deployed
+#     RELAY_STATIC_KEY, base64url. It is public (the relay logs it at boot), so
+#     it is a variable, not a secret. Set it BEFORE tagging a key rotation.
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+jobs:
+  dispatch:
+    name: Dispatch relay-released to streamer
+    runs-on: ubuntu-latest
+    steps:
+      - name: Send repository_dispatch
+        env:
+          GH_TOKEN: ${{ secrets.STREAMER_DISPATCH_PAT }}
+          TAG: ${{ github.ref_name }}
+          REF_TYPE: ${{ github.ref_type }}
+          KEY: ${{ vars.RELAY_PUBLIC_KEY }}
+        run: |
+          # A manual run resends a release: pick the tag as "Use workflow from",
+          # otherwise TAG is a branch name and the streamer refuses it.
+          if [ "$REF_TYPE" != "tag" ]; then
+            echo "::error::run this from a v* tag, not the branch '$TAG'"; exit 1
+          fi
+          if [ -z "$KEY" ]; then
+            echo "::error::repository variable RELAY_PUBLIC_KEY is not set"; exit 1
+          fi
+          gh api -X POST repos/RonenMars/threadbase-streamer/dispatches \
+            -f event_type=relay-released \
+            -f "client_payload[tag]=${TAG}" \
+            -f "client_payload[public_key]=${KEY}"
